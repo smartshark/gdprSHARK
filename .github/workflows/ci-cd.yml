@@ -1,0 +1,33 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-n-publish:
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.7
+      - name: Install Dependencies
+        run: |
+          pip install -U pip setuptools
+      - name: Install Package
+        run: |
+          python setup.py install
+      - name: Build Plugin
+        run: |
+          cd plugin_packaging
+          chmod +rx build_plugin.sh
+          ./build_plugin.sh
+          cd ..
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: plugin_packaging/gdprSHARK_plugin.tar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
