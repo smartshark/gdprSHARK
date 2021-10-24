@@ -1,3 +1,4 @@
+import math
 import re
 import time
 
@@ -14,80 +15,105 @@ def get_email_re():
     return f'({local_part}@{domain_part})'
 
 
-def fetch_data(object_class, fetch_features, logger, max_objects=None, chunk_size=None):
-    """Fetch a dataframe from a smartSHARK database.
+def load_email_dict(db, logger):
+    """Fetches email addresses and person ids from database, filters for valid email addresses,
+    and returns a dict with the email address as key and the person id(s) as value.
+
+    If there are multiple entries in the people collection associated with the same email address,
+    the value in the dict is not one single id, but a comma-separated string with all the associated ids.
+    For more than 10 associated entries, the email address is considered a non-personal address and not filtered anymore.
 
     Args:
-        object_class (pycoshark.mongomodel): database object typ to fetch
-        fetch_features (list(str)): features to fetch from the database
-        logger: Logging object
-        max_objects (int): maximum number of objects to fetch
-        chunk_size (int): size after which the current state is logged
+        db (MongoClient): mongoDB database handle
+        logger: logging object
 
     Returns:
-        (list[attributes]): fetched data
+        (dict(str,str)): dictionary with the cleaned email addresses as key and the id(s) as value
     """
-    start_time = time.time()
-    i, chunk_count = 0, 0
-    fetch_list = []
-    for obj in object_class.objects().only(*fetch_features):
-        attr_list = []
-        for feature in fetch_features:
-            attr_list.append(getattr(obj, feature))
-        fetch_list.append(attr_list)
-        i += 1
-        if chunk_size is not None:
-            if i % chunk_size == 0:
-                chunk_count += 1
-                logger.info(f'fetched {chunk_count*chunk_size} elements...')
-        if max_objects is not None:
-            if i >= max_objects:
-                logger.info(f"reached max number of objects limit")
-                break
+    element_ids = [element['_id'] for element in db['people'].find(no_cursor_timeout=True)]
+    logger.info(f"start loading email addresses ({len(element_ids)} people total)")
+    email_list = []
+    for i in range(0, math.ceil(len(element_ids) / 100)):
+        slice_start = i * 100
+        slice_end = min((i + 1) * 100, len(element_ids))
+        cur_element_slice = element_ids[slice_start:slice_end]
+        if db['people'].count_documents({'_id': {'$in': cur_element_slice}}) > 0:
+            data = db['people'].find({'_id': {'$in': cur_element_slice}}, no_cursor_timeout=True)
+            for instance in data:
+                if 'email' in instance:
+                    email_list.append([instance['_id'], instance['email']])
 
-    logger.info(f"fetched {len(fetch_list)} elements in {time.time() - start_time:.1f} s")
-    return fetch_list
+    if not email_list:
+        error_msg = "Not able to load email addresses."
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
-
-def create_and_clean_email_dict(email_list):
-    """Cleans emails by setting to lower case, filtering with regular expression and dropping all duplicate addresses.
-
-    Args:
-        email_list (list): contains ids of persons and the according email addresses
-
-    Returns:
-        (dict): dictionary with the cleaned email addresses as key and the id as value
-    """
-    id_list = [i[0] for i in email_list]
+    id_list = [str(i[0]) for i in email_list]
     extracted_addresses = [re.findall(get_email_re(), i[1].lower()) for i in email_list]
-
-    duplicate_list = set()
-    addr_dict = dict()
-    for people_id, addr in zip(id_list, extracted_addresses):
-        if not addr:
+    ten_duplicates_list = set()
+    address_dict = dict()
+    for people_id, address in zip(id_list, extracted_addresses):
+        if not address:  # if the re finds no valid email in the email field
             pass
         else:
-            addr = addr[0]
-            if addr in duplicate_list:
+            address = address[0]  # if the re finds more than one valid email in the email field
+            if address in ten_duplicates_list:
                 continue
             else:
-                if addr in addr_dict:
-                    duplicate_list.add(addr)
-                    addr_dict.pop(addr)
+                if address in address_dict:
+                    if address_dict[address].count(",") >= 9:
+                        ten_duplicates_list.add(address)
+                        address_dict.pop(address)
+                    else:
+                        address_dict[address] = ",".join((address_dict[address], people_id))
                 else:
-                    addr_dict[addr] = people_id
-    return addr_dict
+                    address_dict[address] = people_id
+    return address_dict
 
 
-def filter_email_addresses(text):
-    """Returns all email address regular expressions found in the document or None if none are found."""
-    if re.findall(get_email_re(), text):
-        return re.findall(get_email_re(), text)
-    else:
-        return None
+def update_db_with_email_filter(db, collection_name, field_name, email_dict, logger):
+    """Fetches a collection from the database and replaces email addresses batch-wise for one field.
+
+    Args:
+        db (MongoClient): mongoDB database handle
+        collection_name (str): name of the collection to update
+        field_name (str): name of the field to update
+        email_dict (dict(str, str)): dictionary with address as key and person id as value
+        logger: logging object
+    """
+    start_time = time.time()
+    overall_documents_count = 0
+    overall_found_count = 0
+    overall_replace_count = 0
+    element_ids = [element['_id'] for element in db[collection_name].find(no_cursor_timeout=True)]
+    logger.info(f"start loading '{collection_name}' and replacing email addresses in the field '{field_name}' "
+                f"({len(element_ids)} '{collection_name}' total)")
+
+    for i in range(0, math.ceil(len(element_ids) / 100)):
+        slice_start = i * 100
+        slice_end = min((i + 1) * 100, len(element_ids))
+        cur_element_slice = element_ids[slice_start:slice_end]
+        if db[collection_name].count_documents({'_id': {'$in': cur_element_slice}}) > 0:
+            data = db[collection_name].find({'_id': {'$in': cur_element_slice}}, no_cursor_timeout=True)
+            for instance in data:
+                if field_name in instance:
+                    updated_text, found_count, replace_count = find_and_replace_email(instance[field_name], email_dict)
+                    overall_documents_count += 1
+                    overall_found_count += found_count
+                    overall_replace_count += replace_count
+                    if replace_count > 0:
+                        db[collection_name].update({"_id": instance['_id']},
+                                                   {"$set": {field_name: updated_text}})
+    logger.info("replacement statistics:")
+    logger.info(f"searched fields: {overall_documents_count}")
+    logger.info(f"found emails:    {overall_found_count}")
+    logger.info(f"replaced emails: {overall_replace_count}")
+    logger.info(f"time needed:     {time.time() - start_time:.3f} s")
+    if overall_documents_count == 0:
+        logger.error(f"No documents with the field '{field_name}' found in the collection '{collection_name}'.")
 
 
-def find_and_replace_email_single_file(text, email_dict):
+def find_and_replace_email(text, email_dict):
     """Searches in a string for email regular expressions.
     If there are findings these are looked for in the address dictionary and replaced by a token if there is a match.
 
@@ -116,41 +142,9 @@ def find_and_replace_email_single_file(text, email_dict):
     return text, found_counter, replace_counter
 
 
-def find_and_replace_email(object_class, field_name, text_list, email_dict, logger):
-    """Wrapper around find_and_replace_email_single_file function to find and replace regular expressions in a list of documents.
-
-    Args:
-        object_class (pycoshark.mongomodel): class of pycoshark object to update
-        field_name (str): name of the field to look for email addresses
-        text_list (list(str)): list of documents to be searched for addresses
-        email_dict (dict): dictionary with address as key and person id as value
-        logger: Logging object
-
-    Returns:
-        (tuple):
-            - list of documents containing the replacement tokens
-            - count for email regular expressions found in all documents
-            - count for the email regular expressions replaced by a token from the dictionary in all documents
-    """
-    start_time = time.time()
-    overall_found_counter = 0
-    overall_replace_counter = 0
-    updated_text_list = []
-    for document_id, text in text_list:
-        if text is not None:
-            updated_text, temp_found_counter, temp_replace_counter = find_and_replace_email_single_file(text, email_dict)
-            if temp_found_counter > 0:
-                doc = object_class.objects(id=document_id)
-                update_field = {field_name: updated_text}
-                doc.update(**update_field)
-            updated_text_list.append(updated_text)
-            overall_found_counter += temp_found_counter
-            overall_replace_counter += temp_replace_counter
-
-    logger.info("replacement statistics:")
-    logger.info(f"objects:         {len(text_list)}")
-    logger.info(f"found emails:    {overall_found_counter}")
-    logger.info(f"replaced emails: {overall_replace_counter}")
-    logger.info(f"time needed:     {time.time() - start_time:.3f} s")
-
-    return updated_text_list, overall_found_counter, overall_replace_counter
+def filter_email_addresses(text):
+    """Returns all email address regular expressions found in the document or None if none are found."""
+    if re.findall(get_email_re(), text):
+        return re.findall(get_email_re(), text)
+    else:
+        return None
